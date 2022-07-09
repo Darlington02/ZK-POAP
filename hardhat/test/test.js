@@ -1,61 +1,170 @@
-const { expect, assert } = require("chai");
-const { ethers } = require("hardhat");
-const { groth16 } = require("snarkjs");
-const wasm_tester = require("circom_tester").wasm;
+const { expect, assert } = require("chai")
+const { ethers } = require("hardhat")
+const { BigNumber } = require("ethers")
+const { buildPoseidon, poseidonContract } = require("circomlibjs")
+const { exportCallDataGroth16 } = require("./utils/utils");
 
-const F1Field = require("ffjavascript").F1Field;
-const Scalar = require("ffjavascript").Scalar;
-exports.p = Scalar.fromString("21888242871839275222246405745257275088548364400416034343698204186575808495617");
-const Fr = new F1Field(exports.p);
+describe("ZKPOAP", function() {
+    let Poap
+    let poap
+    let Verifier
+    let verifier
+    let Poseidon
+    let poseidon
+    let Poseidon2
+    let poseidon2
+    let preImage = 1234
+    let name = "BCAT"
+    let symbol = "BC"
+    let signer
+    let addrs
 
-describe("Circuit test", function () {
+    beforeEach(async function() {
+        // deploy verifier Contract
+        Verifier = await ethers.getContractFactory("Verifier")
+        verifier = await Verifier.deploy()
+        await verifier.deployed()
 
-    it("Multipler2 test", async () => {
-        const circuit = await wasm_tester("circuits/circuit.circom");
-        await circuit.loadConstraints();
+        // deploy poseidon hashing contract [single input]
+        Poseidon = await ethers.getContractFactory(
+            poseidonContract.generateABI(1),
+            poseidonContract.createCode(1)
+        )
+        poseidon = await Poseidon.deploy();
+        await poseidon.deployed();
 
-        const INPUT = {
-            "a": 2,
-            "b": 3
-        }
+        // deploy poseidon2 hashing contract [double input]
+        Poseidon2 = await ethers.getContractFactory(
+            poseidonContract.generateABI(2),
+            poseidonContract.createCode(2)
+        )
+        poseidon2 = await Poseidon2.deploy();
+        await poseidon2.deployed();
 
-        const witness = await circuit.calculateWitness(INPUT, true);
+        // deploy NFTMint Contract
+        Poap = await ethers.getContractFactory("NFTMint");
 
-        assert(Fr.eq(Fr.e(witness[0]),Fr.e(1)));
-        assert(Fr.eq(Fr.e(witness[1]),Fr.e(6)));
-    });
-});
+        const hashedPreimage = await poseidon["poseidon(uint256[1])"]([preImage])
 
-describe("Verifier Contract", function () {
-    let Verifier;
-    let verifier;
+        poap = await Poap.deploy(verifier.address, hashedPreimage, name, symbol);
+        await poap.deployed();
 
-    beforeEach(async function () {
-        Verifier = await ethers.getContractFactory("Verifier");
-        verifier = await Verifier.deploy();
-        await verifier.deployed();
-    });
+        [signer, ...addrs] = await ethers.getSigners()
+    })
 
-    it("Should return true for correct proofs", async function () {
+    describe("Proof Verification", async function() {
 
-        const { proof, publicSignals } = await groth16.fullProve({"a":"1","b":"2"}, "circuits/build/circuit_js/circuit.wasm","circuits/build/circuit_final.zkey");
+        it("should verify proof", async function() {
 
-        const calldata = await groth16.exportSolidityCallData(proof, publicSignals);
-    
-        const argv = calldata.replace(/["[\]\s]/g, "").split(',').map(x => BigInt(x).toString());
-    
-        const a = [argv[0], argv[1]];
-        const b = [[argv[2], argv[3]], [argv[4], argv[5]]];
-        const c = [argv[6], argv[7]];
-        const Input = argv.slice(8);
+            const hashedImage = await poseidon["poseidon(uint256[1])"]([preImage])
 
-        expect(await verifier.verifyProof(a, b, c, Input)).to.be.true;
-    });
-    it("Should return false for invalid proof", async function () {
-        let a = [0, 0];
-        let b = [[0, 0], [0, 0]];
-        let c = [0, 0];
-        let d = [0];
-        expect(await verifier.verifyProof(a, b, c, d)).to.be.false;
-    });
-});
+            const input = {
+                preImage: preImage,
+                hash: hashedImage.toString(),
+                address: signer.address,
+            }
+
+            // generate proof data
+            let dataResult = await exportCallDataGroth16(
+                input,
+                "circuits/build/circuit_js/circuit.wasm",
+                "circuits/build/circuit_final.zkey"
+            );
+            
+            // Call the verify proof function
+            let result = await verifier.verifyProof(
+            dataResult.a,
+            dataResult.b,
+            dataResult.c,
+            dataResult.Input
+            );
+            expect(result).to.equal(true);
+        })
+        
+    })
+
+    describe("NFTMinting", async function() {
+
+        it("Should mint nft", async function() {
+            // generate nullifier by hashing preimage with signer address
+            const nullifier = await poseidon2["poseidon(uint256[2])"]([preImage, signer.address])
+
+            // get the hash of the preImage
+            const hashedImage = await poseidon["poseidon(uint256[1])"]([preImage])
+
+            // inputs for verifier contract
+            const input = {
+                preImage: preImage,
+                hash: hashedImage.toString(),
+                address: signer.address,
+            }
+
+            // generate proof data
+            let dataResult = await exportCallDataGroth16(
+                input,
+                "circuits/build/circuit_js/circuit.wasm",
+                "circuits/build/circuit_final.zkey"
+            );
+            
+            await poap.mintWithProof(nullifier, dataResult.a, dataResult.b, dataResult.c)
+            
+        })
+
+        it("Should not mint nft for wrong preImage", async function() {
+            const wrongImage = 4567
+            // generate nullifier by hashing preimage with signer address
+            const nullifier = await poseidon2["poseidon(uint256[2])"]([wrongImage, signer.address])
+
+            // get the hash of the preImage
+            const hashedImage = await poseidon["poseidon(uint256[1])"]([wrongImage])
+
+            // inputs for verifier contract
+            const input = {
+                preImage: wrongImage,
+                hash: hashedImage.toString(),
+                address: signer.address,
+            }
+
+            // generate proof data
+            let dataResult = await exportCallDataGroth16(
+                input,
+                "circuits/build/circuit_js/circuit.wasm",
+                "circuits/build/circuit_final.zkey"
+            );
+            
+            await expect(poap.mintWithProof(nullifier, dataResult.a, dataResult.b, dataResult.c)).to.be.revertedWith("NFTMint: Invalid proof")
+            
+        })
+
+        it("Should not mint nft twice", async function() {
+            // generate nullifier by hashing preimage with signer address
+            const nullifier = await poseidon2["poseidon(uint256[2])"]([preImage, signer.address])
+
+            // get the hash of the preImage
+            const hashedImage = await poseidon["poseidon(uint256[1])"]([preImage])
+
+            // inputs for verifier contract
+            const input = {
+                preImage: preImage,
+                hash: hashedImage.toString(),
+                address: signer.address,
+            }
+
+            // generate proof data
+            let dataResult = await exportCallDataGroth16(
+                input,
+                "circuits/build/circuit_js/circuit.wasm",
+                "circuits/build/circuit_final.zkey"
+            );
+
+            // mint nft
+            await poap.mintWithProof(nullifier, dataResult.a, dataResult.b, dataResult.c)
+            
+            // try to mint again
+            await expect(poap.mintWithProof(nullifier, dataResult.a, dataResult.b, dataResult.c)).to.be.revertedWith("NFTMint: Nullifier is used")
+            
+        })
+
+    })
+
+})
